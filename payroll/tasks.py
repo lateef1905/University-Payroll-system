@@ -1,12 +1,15 @@
 """Celery tasks: bulk payroll calculation and report dispatch."""
+import calendar
 import logging
+from datetime import date
 from decimal import Decimal
 
 from celery import shared_task
 from django.conf import settings
 from django.core.mail import EmailMessage, get_connection, send_mass_mail
-from django.db import transaction
-from django.db.models import Count, Sum
+from django.db import DatabaseError, transaction
+from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import Coalesce, Now
 from django.utils import timezone
 
 from accounts.models import Role, User
@@ -57,23 +60,76 @@ def _build_record(batch: PayrollBatch, staff: StaffProfile, b: PayrollBreakdown)
     )
 
 
+def _log_error(errors: list, staff_id, message: str):
+    if len(errors) < MAX_LOGGED_ERRORS:
+        errors.append({"staff_id": staff_id, "error": message})
+
+
+def _save_chunk(buffer: list, errors: list):
+    """
+    Persist one chunk of records and account for EVERY row.
+
+    Fast path: one bulk INSERT. If the database rejects anything (unique race with
+    another batch, a CHECK constraint, numeric overflow...), fall back to row-by-row
+    inserts in savepoints so each row is either saved, skipped (already paid by
+    someone else) or reported as failed - never silently dropped.
+
+    Returns (saved, skipped, failed).
+    """
+    if not buffer:
+        return 0, 0, 0
+    try:
+        with transaction.atomic():
+            PayrollRecord.objects.bulk_create(buffer)
+        return len(buffer), 0, 0
+    except DatabaseError:
+        logger.warning("Bulk insert of %s records rejected; retrying row by row.", len(buffer))
+
+    saved = skipped = failed = 0
+    for record in buffer:
+        record.pk = None
+        record._state.adding = True
+        try:
+            with transaction.atomic():
+                record.save()
+            saved += 1
+        except DatabaseError as exc:
+            already_paid = PayrollRecord.objects.filter(
+                staff_id=record.staff_id, period_year=record.period_year, period_month=record.period_month
+            ).exists()
+            if already_paid:
+                skipped += 1
+            else:
+                failed += 1
+                _log_error(errors, record.staff.staff_id, f"Database rejected record: {str(exc)[:200]}")
+    return saved, skipped, failed
+
+
 @shared_task(bind=True, name="payroll.process_payroll_batch")
 def process_payroll_batch(self, batch_id: str):
     """
     Calculate and persist payroll for every active staff member in the batch's faculties.
 
     Safety properties:
-      * Claimed atomically (PENDING -> PROCESSING) so a duplicate delivery is a no-op.
+      * Claimed atomically (PENDING -> PROCESSING). A re-delivery of the SAME task
+        (acks_late after a worker crash keeps the task id) resumes the batch; any
+        other duplicate delivery is a no-op.
       * Idempotent: staff who already have a record for the period are skipped, so a
-        re-run (or acks_late redelivery) can never double-pay.
+        re-run (or resume) can never double-pay.
       * One bad employee never aborts the batch; the error is logged on the batch.
+      * Every staff member in scope is accounted for: processed + skipped + failed
+        must equal total, otherwise the batch is flagged with a reconciliation error.
       * Records are written in chunked transactions to bound memory and lock time.
     """
-    claimed = PayrollBatch.objects.filter(pk=batch_id, status=BatchStatus.PENDING).update(
-        status=BatchStatus.PROCESSING, started_at=timezone.now(), celery_task_id=self.request.id or ""
+    task_id = self.request.id or ""
+    claimable = Q(status=BatchStatus.PENDING)
+    if task_id:
+        claimable |= Q(status=BatchStatus.PROCESSING, celery_task_id=task_id)
+    claimed = PayrollBatch.objects.filter(claimable, pk=batch_id).update(
+        status=BatchStatus.PROCESSING, started_at=Coalesce(F("started_at"), Now()), celery_task_id=task_id
     )
     if not claimed:
-        logger.warning("Batch %s was not PENDING; skipping duplicate delivery.", batch_id)
+        logger.warning("Batch %s is not claimable by task %s; skipping duplicate delivery.", batch_id, task_id)
         return "skipped"
 
     batch = PayrollBatch.objects.get(pk=batch_id)
@@ -83,14 +139,20 @@ def process_payroll_batch(self, batch_id: str):
         scales, rules, bands = _load_reference_data(batch.period_year)
         rates = PayrollRates.from_settings()
         chunk_size = settings.PAYROLL["BATCH_CHUNK_SIZE"]
+        period_end = date(batch.period_year, batch.period_month, calendar.monthrange(batch.period_year, batch.period_month)[1])
 
-        already_paid = set(
-            PayrollRecord.objects.filter(period_year=batch.period_year, period_month=batch.period_month)
-            .values_list("staff_id", flat=True)
-        )
+        period_records = PayrollRecord.objects.filter(period_year=batch.period_year, period_month=batch.period_month)
+        # Paid by THIS batch in an earlier (interrupted) attempt: counted via the DB total below.
+        paid_by_this_batch = set(period_records.filter(batch=batch).values_list("staff_id", flat=True))
+        # Paid by another batch for the same period: skipped.
+        paid_elsewhere = set(period_records.exclude(batch=batch).values_list("staff_id", flat=True))
+
         staff_qs = (
             StaffProfile.objects.filter(
-                is_active=True, user__is_active=True, department__faculty__in=batch.faculties.all()
+                is_active=True,
+                user__is_active=True,
+                date_of_employment__lte=period_end,  # not yet employed in this period -> out of scope
+                department__faculty__in=batch.faculties.all(),
             )
             .select_related("user", "department__faculty")
             .order_by("pk")
@@ -99,15 +161,17 @@ def process_payroll_batch(self, batch_id: str):
         buffer = []
 
         def flush():
-            if buffer:
-                with transaction.atomic():
-                    # ignore_conflicts guards the unique (staff, period) race with another batch.
-                    PayrollRecord.objects.bulk_create(buffer, ignore_conflicts=True)
-                buffer.clear()
+            nonlocal skipped, failed
+            _saved, _skipped, _failed = _save_chunk(buffer, errors)
+            skipped += _skipped
+            failed += _failed
+            buffer.clear()
 
         for staff in staff_qs.iterator(chunk_size=chunk_size):
             total += 1
-            if staff.pk in already_paid:
+            if staff.pk in paid_by_this_batch:
+                continue
+            if staff.pk in paid_elsewhere:
                 skipped += 1
                 continue
             try:
@@ -126,13 +190,11 @@ def process_payroll_batch(self, batch_id: str):
                 )
             except KeyError:
                 failed += 1
-                if len(errors) < MAX_LOGGED_ERRORS:
-                    errors.append({"staff_id": staff.staff_id, "error": f"No salary scale row for {staff.salary_scale} GL{staff.grade_level} step {staff.step}."})
+                _log_error(errors, staff.staff_id, f"No salary scale row for {staff.salary_scale} GL{staff.grade_level} step {staff.step}.")
                 continue
             except PayrollCalculationError as exc:
                 failed += 1
-                if len(errors) < MAX_LOGGED_ERRORS:
-                    errors.append({"staff_id": staff.staff_id, "error": str(exc)})
+                _log_error(errors, staff.staff_id, str(exc))
                 continue
 
             buffer.append(_build_record(batch, staff, breakdown))
@@ -140,19 +202,28 @@ def process_payroll_batch(self, batch_id: str):
                 flush()
         flush()
 
-        # Totals come from the database, so they are exact even after ignored conflicts.
+        # Totals come from the database, so they reflect exactly what was persisted.
         agg = PayrollRecord.objects.filter(batch=batch).aggregate(
             n=Count("id"), gross=Sum("gross_earnings"), ded=Sum("total_deductions"), net=Sum("net_pay")
         )
+        processed = agg["n"] or 0
         batch.total_staff = total
-        batch.processed_count = agg["n"] or 0
+        batch.processed_count = processed
         batch.skipped_count = skipped
         batch.failed_count = failed
         batch.total_gross = agg["gross"] or Decimal("0.00")
         batch.total_deductions = agg["ded"] or Decimal("0.00")
         batch.total_net = agg["net"] or Decimal("0.00")
+
+        reconciled = processed + skipped + failed == total
+        if not reconciled:
+            logger.error("Batch %s does not reconcile: total=%s processed=%s skipped=%s failed=%s", batch_id, total, processed, skipped, failed)
+            errors.append({
+                "staff_id": None,
+                "error": f"Reconciliation mismatch: total={total} processed={processed} skipped={skipped} failed={failed}.",
+            })
         batch.error_log = errors
-        batch.status = BatchStatus.COMPLETED_WITH_ERRORS if failed else BatchStatus.COMPLETED
+        batch.status = BatchStatus.COMPLETED if (reconciled and not failed) else BatchStatus.COMPLETED_WITH_ERRORS
     except Exception as exc:  # noqa: BLE001 - last-resort guard; recorded on the batch
         logger.exception("Payroll batch %s failed", batch_id)
         batch.status = BatchStatus.FAILED
@@ -186,10 +257,13 @@ def send_batch_report(batch_id: str):
             lines.append("")
             lines.append("First errors:")
             lines += [f"- {e.get('staff_id') or 'BATCH'}: {e['error']}" for e in batch.error_log[:20]]
-        EmailMessage(
-            subject=f"[Payroll] {period} - {batch.get_status_display()}",
-            body="\n".join(lines), from_email=settings.DEFAULT_FROM_EMAIL, to=managers,
-        ).send(fail_silently=False)
+        try:
+            EmailMessage(
+                subject=f"[Payroll] {period} - {batch.get_status_display()}",
+                body="\n".join(lines), from_email=settings.DEFAULT_FROM_EMAIL, to=managers,
+            ).send(fail_silently=False)
+        except Exception:  # noqa: BLE001 - must not block staff notifications below
+            logger.exception("Failed sending manager report for batch %s", batch_id)
 
     if settings.PAYROLL["NOTIFY_STAFF_BY_EMAIL"] and batch.processed_count:
         # No amounts in email: only a pointer to the authenticated portal.
@@ -207,3 +281,11 @@ def send_batch_report(batch_id: str):
             except Exception:  # noqa: BLE001 - notification failure must not affect payroll
                 logger.exception("Failed sending staff notification chunk %s for batch %s", i, batch_id)
     return "sent"
+
+
+@shared_task(name="payroll.fail_stale_batches")
+def fail_stale_batches_task():
+    """Periodic sweep (Celery beat) - see payroll.maintenance.fail_stale_batches."""
+    from .maintenance import fail_stale_batches
+
+    return fail_stale_batches()

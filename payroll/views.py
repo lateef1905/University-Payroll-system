@@ -1,6 +1,8 @@
 import re
+import uuid
 
 from django.http import HttpResponse
+from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import filters, mixins, status, viewsets
@@ -10,9 +12,11 @@ from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 
 from accounts.permissions import IsPayrollManager
+from audit.events import log_event
+from audit.models import AuditAction
 from staff.views import ProtectedDeleteMixin
 
-from .models import AllowanceRule, PayrollBatch, PayrollRecord, SalaryScale, TaxBand
+from .models import AllowanceRule, BatchStatus, PayrollBatch, PayrollRecord, SalaryScale, TaxBand
 from .payslip import render_payslip_pdf
 from .serializers import (
     AllowanceRuleSerializer,
@@ -80,13 +84,50 @@ class PayrollBatchViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins
         serializer = PayrollBatchCreateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         batch = serializer.save()
+        log_event(
+            request, AuditAction.BATCH_TRIGGERED, target=batch,
+            period=f"{batch.period_year}-{batch.period_month:02d}",
+            faculty_ids=sorted(batch.faculties.values_list("pk", flat=True)),
+        )
+        batch.refresh_from_db()  # inline (eager) runs may already have finished
         return Response(PayrollBatchSerializer(batch).data, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(request=None, responses=PayrollBatchSerializer)
+    @action(detail=True, methods=["post"], url_path="mark-failed")
+    def mark_failed(self, request, pk=None):
+        """
+        Manually fail a stuck PENDING/PROCESSING batch (e.g. its worker died) so the
+        period can be re-triggered. Re-running is safe: already-paid staff are skipped.
+        """
+        batch = self.get_object()
+        updated = PayrollBatch.objects.filter(
+            pk=batch.pk, status__in=[BatchStatus.PENDING, BatchStatus.PROCESSING]
+        ).update(
+            status=BatchStatus.FAILED,
+            completed_at=timezone.now(),
+            error_log=list(batch.error_log or []) + [
+                {"staff_id": None, "error": f"Manually marked as failed by {request.user.username}."}
+            ],
+        )
+        if not updated:
+            return Response(
+                {"detail": f"Only PENDING or PROCESSING batches can be marked as failed (this one is {batch.status})."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        log_event(request, AuditAction.BATCH_MARKED_FAILED, target=batch, previous_status=batch.status)
+        batch.refresh_from_db()
+        return Response(PayrollBatchSerializer(batch).data)
 
 
 _FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def _pdf_response(record: PayrollRecord) -> HttpResponse:
+def _pdf_response(request, record: PayrollRecord) -> HttpResponse:
+    log_event(
+        request, AuditAction.PAYSLIP_DOWNLOADED, target=record,
+        staff_id=record.staff.staff_id, period=f"{record.period_year}-{record.period_month:02d}",
+        own_payslip=record.staff.user_id == request.user.pk,
+    )
     filename = _FILENAME_UNSAFE.sub("_", f"Payslip-{record.staff.staff_id}-{record.period_year}-{record.period_month:02d}.pdf")
     response = HttpResponse(render_payslip_pdf(record), content_type="application/pdf")
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -109,6 +150,8 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
     ordering_fields = ["period_year", "period_month", "net_pay"]
 
     def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # schema generation: no real user
+            return PayrollRecord.objects.none()
         qs = PayrollRecord.objects.select_related("staff__user", "staff__department__faculty")
         user = self.request.user
         if not user.is_payroll_manager:
@@ -120,7 +163,10 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(period_month=p["month"])
         if user.is_payroll_manager:
             if p.get("batch"):
-                qs = qs.filter(batch_id=p["batch"])
+                try:
+                    qs = qs.filter(batch_id=uuid.UUID(p["batch"]))
+                except ValueError:
+                    raise ValidationError({"batch": "Must be a valid batch UUID."})
             if p.get("faculty", "").isdigit():
                 qs = qs.filter(staff__department__faculty_id=p["faculty"])
             if p.get("staff_id"):
@@ -131,7 +177,7 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=True, methods=["get"], url_path="payslip", throttle_classes=[PayslipDownloadThrottle])
     def payslip(self, request, pk=None):
         """Generate and download the PDF payslip for one record."""
-        return _pdf_response(self.get_object())
+        return _pdf_response(request, self.get_object())
 
     @extend_schema(
         parameters=[
@@ -153,4 +199,4 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
         )
         if record is None:
             raise NotFound("No payslip exists for that period.")
-        return _pdf_response(record)
+        return _pdf_response(request, record)

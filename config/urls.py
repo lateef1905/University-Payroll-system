@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/auth/", include("accounts.urls")),
     path("api/staff/", include("staff.urls")),
     path("api/payroll/", include("payroll.urls")),
+    path("api/audit/", include("audit.urls")),
     # OpenAPI schema + interactive docs (restricted to admins when DEBUG=False)
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
     path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),

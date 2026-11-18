@@ -1,0 +1,17 @@
+# Direct dependencies with allowed version ranges.
+# Edit THIS file, then regenerate the pinned lock file:
+#   pip install -r requirements.in && pip freeze > requirements.txt   (then restore the header)
+#   or: pip-compile requirements.in   /   uv pip compile requirements.in -o requirements.txt
+Django>=5.2,<5.3
+djangorestframework>=3.15
+djangorestframework-simplejwt>=5.3
+drf-spectacular>=0.27
+celery>=5.4
+redis>=5.0
+psycopg2-binary>=2.9
+reportlab>=4.0
+python-dotenv>=1.0
+gunicorn>=22.0
+packaging>=24.0      # kombu's Redis transport imports it without declaring it
+whitenoise>=6.7      # serves static files (admin CSS/JS) when DEBUG=False
+django-simple-history>=3.7   # audit trail: change history of payroll/staff/user data

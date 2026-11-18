@@ -1,13 +1,17 @@
 
+import copy
+
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
 from staff.models import Faculty
 
+from .calculator import PayrollCalculationError, TaxBandSpec, validate_tax_bands
+from .maintenance import fail_stale_batches
+from .validators import check_allowance_rule, check_tax_band
 from .models import (
-    AllowanceMethod,
     AllowanceRule,
     BatchStatus,
     PayrollBatch,
@@ -15,6 +19,23 @@ from .models import (
     SalaryScale,
     TaxBand,
 )
+
+
+def _run_model_check(serializer, attrs, model, check):
+    """Apply a shared payroll.validators check to the instance as it WOULD be saved."""
+    if serializer.instance is not None:
+        candidate = copy.copy(serializer.instance)
+    else:
+        candidate = model()
+    for field, value in attrs.items():
+        setattr(candidate, field, value)
+    try:
+        check(candidate)
+    except DjangoValidationError as exc:
+        raise serializers.ValidationError(
+            exc.message_dict if hasattr(exc, "error_dict") else exc.messages
+        )
+    return attrs
 
 
 class SalaryScaleSerializer(serializers.ModelSerializer):
@@ -54,32 +75,7 @@ class AllowanceRuleSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def validate(self, attrs):
-        get = lambda f: attrs.get(f, getattr(self.instance, f, None))  # noqa: E731
-        method, value = get("calc_method"), get("value")
-        if method == AllowanceMethod.PERCENT_OF_BASIC and value > 100:
-            raise serializers.ValidationError({"value": "A percentage cannot exceed 100."})
-        if get("min_grade") > get("max_grade"):
-            raise serializers.ValidationError({"min_grade": "min_grade cannot exceed max_grade."})
-
-        # Two active rules of the same type that can match the same employee would double-pay.
-        if get("is_active"):
-            qs = AllowanceRule.objects.filter(
-                is_active=True, allowance_type=get("allowance_type"),
-                min_grade__lte=get("max_grade"), max_grade__gte=get("min_grade"),
-            )
-            if self.instance:
-                qs = qs.exclude(pk=self.instance.pk)
-            emp = get("employment_type")
-            if emp != "ALL":
-                qs = qs.filter(Q(employment_type="ALL") | Q(employment_type=emp))
-            scale = get("salary_scale")
-            if scale:
-                qs = qs.filter(Q(salary_scale__isnull=True) | Q(salary_scale="") | Q(salary_scale=scale))
-            if qs.exists():
-                raise serializers.ValidationError(
-                    "An active rule of this allowance type already overlaps this employment type / scale / grade range."
-                )
-        return attrs
+        return _run_model_check(self, attrs, AllowanceRule, check_allowance_rule)
 
 
 class TaxBandSerializer(serializers.ModelSerializer):
@@ -89,20 +85,7 @@ class TaxBandSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def validate(self, attrs):
-        get = lambda f: attrs.get(f, getattr(self.instance, f, None))  # noqa: E731
-        lower, upper = get("lower_bound"), get("upper_bound")
-        if upper is not None and upper <= lower:
-            raise serializers.ValidationError({"upper_bound": "Must be greater than lower_bound."})
-        # Reject overlapping slices within the same tax year.
-        qs = TaxBand.objects.filter(tax_year=get("tax_year"))
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-        for other in qs:
-            other_upper_ok = other.upper_bound is None or other.upper_bound > lower
-            this_upper_ok = upper is None or upper > other.lower_bound
-            if other_upper_ok and this_upper_ok:
-                raise serializers.ValidationError("This band overlaps an existing band for the same tax year.")
-        return attrs
+        return _run_model_check(self, attrs, TaxBand, check_tax_band)
 
 
 class PayrollBatchSerializer(serializers.ModelSerializer):
@@ -119,6 +102,17 @@ class PayrollBatchSerializer(serializers.ModelSerializer):
             "created_at", "started_at", "completed_at",
         ]
         read_only_fields = fields
+
+
+CLASH_MESSAGE = "A batch for this period and faculty is already pending or processing."
+
+
+def _clashing_batch_exists(year, month, faculties) -> bool:
+    return PayrollBatch.objects.filter(
+        period_year=year, period_month=month,
+        status__in=[BatchStatus.PENDING, BatchStatus.PROCESSING],
+        faculties__in=faculties,
+    ).exists()
 
 
 class PayrollBatchCreateSerializer(serializers.Serializer):
@@ -147,20 +141,34 @@ class PayrollBatchCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError("Select at least one faculty (or set all_faculties=true).")
         attrs["faculties"] = faculties
 
-        # Refuse to start while an overlapping batch for the same period is still running.
-        clash = PayrollBatch.objects.filter(
-            period_year=year, period_month=month,
-            status__in=[BatchStatus.PENDING, BatchStatus.PROCESSING],
-            faculties__in=faculties,
-        ).exists()
-        if clash:
-            raise serializers.ValidationError("A batch for this period and faculty is already pending or processing.")
+        # Fail fast (400) instead of creating a batch that would immediately FAIL.
+        bands = [
+            TaxBandSpec(lower=b.lower_bound, upper=b.upper_bound, rate_percent=b.rate_percent)
+            for b in TaxBand.objects.filter(tax_year=year)
+        ]
+        try:
+            validate_tax_bands(bands)
+        except PayrollCalculationError as exc:
+            raise serializers.ValidationError(f"Tax bands for {year} are missing or invalid: {exc}")
+
+        # Batches whose worker died must not block new runs forever.
+        fail_stale_batches()
+        if _clashing_batch_exists(year, month, faculties):
+            raise serializers.ValidationError(CLASH_MESSAGE)
         return attrs
 
     def create(self, validated_data):
         from .tasks import process_payroll_batch  # local import avoids a circular import at load time
 
         with transaction.atomic():
+            # Serialise concurrent triggers for the same faculties, then re-check the clash
+            # under the lock (the check in validate() alone is a check-then-act race).
+            # On SQLite select_for_update is a no-op, but SQLite already allows one writer.
+            faculty_ids = sorted(f.pk for f in validated_data["faculties"])
+            list(Faculty.objects.select_for_update().filter(pk__in=faculty_ids).order_by("pk"))
+            if _clashing_batch_exists(validated_data["period_year"], validated_data["period_month"], faculty_ids):
+                raise serializers.ValidationError(CLASH_MESSAGE)
+
             batch = PayrollBatch.objects.create(
                 period_year=validated_data["period_year"],
                 period_month=validated_data["period_month"],

@@ -7,6 +7,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import Q
+from simple_history.models import HistoricalRecords
 
 
 class TimeStampedModel(models.Model):
@@ -41,6 +42,7 @@ MAX_STEP = 15
 class Faculty(TimeStampedModel):
     name = models.CharField(max_length=150, unique=True)
     code = models.CharField(max_length=10, unique=True, validators=[RegexValidator(r"^[A-Z0-9]{2,10}$", "Use 2-10 uppercase letters/digits.")])
+    history = HistoricalRecords()
 
     class Meta:
         verbose_name_plural = "faculties"
@@ -54,6 +56,7 @@ class Department(TimeStampedModel):
     faculty = models.ForeignKey(Faculty, on_delete=models.PROTECT, related_name="departments")
     name = models.CharField(max_length=150)
     code = models.CharField(max_length=10, validators=[RegexValidator(r"^[A-Z0-9]{2,10}$", "Use 2-10 uppercase letters/digits.")])
+    history = HistoricalRecords()
 
     class Meta:
         ordering = ["faculty__name", "name"]
@@ -90,6 +93,8 @@ class StaffProfile(TimeStampedModel):
     annual_rent_paid = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"), validators=[MinValueValidator(Decimal("0.00"))])
     cooperative_monthly_dues = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), validators=[MinValueValidator(Decimal("0.00"))])
     loan_monthly_repayment = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), validators=[MinValueValidator(Decimal("0.00"))])
+
+    history = HistoricalRecords()
 
     class Meta:
         ordering = ["staff_id"]
