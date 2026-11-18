@@ -5,7 +5,7 @@ from payroll.maintenance import fail_stale_batches
 
 
 class Command(BaseCommand):
-    help = "Mark stuck PENDING/PROCESSING payroll batches older than the Celery time limit as FAILED."
+    help = "Mark stuck PENDING/PROCESSING payroll batches older than the broker re-delivery timeout (+10 min) as FAILED."
 
     def handle(self, *args, **opts):
         count = fail_stale_batches()

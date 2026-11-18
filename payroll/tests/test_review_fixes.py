@@ -223,6 +223,16 @@ class ReviewFixTests(APITestCase):
         self.login("bursar")
         self.assertEqual(self.trigger().status_code, 400)
 
+    def test_H1_timeouts_are_ordered(self):
+        """task time limit < broker re-delivery < stale cutoff, so a crashed batch resumes before being failed."""
+        from django.conf import settings
+
+        from payroll.maintenance import stale_after
+
+        redelivery = settings.CELERY_BROKER_TRANSPORT_OPTIONS["visibility_timeout"]
+        self.assertGreater(redelivery, settings.CELERY_TASK_TIME_LIMIT)
+        self.assertGreater(stale_after().total_seconds(), redelivery)
+
     def test_H1_fail_stale_batches_command(self):
         self.new_batch(status=BatchStatus.PROCESSING, started_at=timezone.now() - timedelta(days=1))
         out = StringIO()
@@ -248,8 +258,11 @@ class ReviewFixTests(APITestCase):
         self.assertEqual(self.client.get(f"/api/payroll/records/?batch={batch.pk}").status_code, 200)
 
     def test_M2_manager_email_failure_still_notifies_staff(self):
+        from django.conf import settings
+
         self.login("bursar")
-        with mock.patch.object(tasks.EmailMessage, "send", side_effect=OSError("SMTP down")):
+        notify_on = {**settings.PAYROLL, "NOTIFY_STAFF_BY_EMAIL": True}  # independent of PAYROLL_NOTIFY_STAFF in .env
+        with override_settings(PAYROLL=notify_on), mock.patch.object(tasks.EmailMessage, "send", side_effect=OSError("SMTP down")):
             self.trigger()
         self.assertEqual([m.to for m in mail.outbox], [["alice@x.edu.ng"]])
 

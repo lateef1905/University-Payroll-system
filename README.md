@@ -184,8 +184,10 @@ unlimited: history is never pruned automatically.
   `python manage.py seed_payroll --tax-year 2027` copies the latest year's bands as a starting
   point; edit them in the admin or via `/api/payroll/tax-bands/`. A batch for a year without
   valid bands is rejected with a 400.
-* **Stuck batches:** if a worker dies, a re-delivered task resumes its batch automatically.
-  Batches stuck longer than the Celery time limit (+5 min) are marked FAILED by
+* **Stuck batches:** if a worker dies, Redis re-delivers its task after the visibility
+  timeout (`CELERY_BROKER_TRANSPORT_OPTIONS`, 40 min; keep it above the 35 min task time
+  limit) and the re-delivered task resumes the batch automatically (verified with `kill -9`
+  on a 60k-staff batch). Batches still stuck 10 min after that are marked FAILED by
   `python manage.py fail_stale_batches` (run it from cron every 15 minutes) or by Celery beat
   (`celery -A config beat`, schedule in `CELERY_BEAT_SCHEDULE`). They are also swept whenever a
   new batch is triggered. A manager can force it with

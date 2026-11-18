@@ -212,6 +212,12 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_SOFT_TIME_LIMIT = 60 * 30
 CELERY_TASK_TIME_LIMIT = 60 * 35
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+# With acks_late, Redis re-delivers a task whose worker died only after this
+# timeout (Celery's default is 1 hour). It must stay LONGER than the hard time
+# limit, or a still-running task would be delivered twice. A re-delivered payroll
+# task resumes its batch; payroll.maintenance only fails batches stuck longer
+# than this, so the automatic resume always gets its chance first.
+CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": CELERY_TASK_TIME_LIMIT + 5 * 60}
 # Dev convenience: run tasks inline (no Redis/worker). NEVER enable in production.
 CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_EAGER", False)
 CELERY_TASK_EAGER_PROPAGATES = CELERY_TASK_ALWAYS_EAGER

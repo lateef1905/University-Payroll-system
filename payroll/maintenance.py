@@ -10,12 +10,19 @@ from .models import BatchStatus, PayrollBatch
 
 logger = logging.getLogger(__name__)
 
-# Grace period on top of Celery's hard time limit before a batch counts as abandoned.
-STALE_GRACE = timedelta(minutes=5)
+# Grace period after the broker would have re-delivered the task of a dead worker
+# (see CELERY_BROKER_TRANSPORT_OPTIONS["visibility_timeout"]) before a batch counts
+# as abandoned. Before that point, the re-delivered task resumes the batch itself.
+STALE_GRACE = timedelta(minutes=10)
+
+
+def stale_after() -> timedelta:
+    redelivery = settings.CELERY_BROKER_TRANSPORT_OPTIONS.get("visibility_timeout", 3600)
+    return timedelta(seconds=max(redelivery, settings.CELERY_TASK_TIME_LIMIT)) + STALE_GRACE
 
 
 def stale_cutoff():
-    return timezone.now() - timedelta(seconds=settings.CELERY_TASK_TIME_LIMIT) - STALE_GRACE
+    return timezone.now() - stale_after()
 
 
 def fail_stale_batches() -> int:
@@ -23,7 +30,7 @@ def fail_stale_batches() -> int:
     Mark batches whose worker died as FAILED so they stop blocking new runs.
 
     A batch is stale when it has been PROCESSING (or PENDING, i.e. never picked up)
-    for longer than the Celery hard time limit plus a grace period. Re-triggering is
+    for longer than the broker re-delivery timeout plus a grace period. Re-triggering is
     safe: staff already paid for the period are skipped.
     """
     cutoff = stale_cutoff()
