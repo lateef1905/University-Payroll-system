@@ -1,6 +1,7 @@
 """Custom user model carrying the RBAC role."""
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from simple_history.models import HistoricalRecords
 
 
 class Role(models.TextChoices):
@@ -22,6 +23,10 @@ class User(AbstractUser):
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.STAFF, db_index=True)
 
     REQUIRED_FIELDS = ["email"]
+
+    # Change history. The password hash is never copied into history, and
+    # last_login is excluded because logins are recorded in the activity log.
+    history = HistoricalRecords(excluded_fields=["password", "last_login"])
 
     def save(self, *args, **kwargs):
         # `createsuperuser` sets is_superuser but leaves role at the default.

@@ -1,6 +1,6 @@
 # University of Ibadan - Employee Payroll Management System
 
-Django + DRF + PostgreSQL + Celery/Redis backend with JWT role-based access, a
+Django + DRF + PostgreSQL + Celery/Redis backend (the React client lives in `../Univerisity-Payroll-client`) with JWT role-based access, a
 Decimal-safe calculation engine, bulk monthly payroll batches and PDF payslips.
 
 > **Read this first.** The salary figures produced by `seed_payroll` are
@@ -14,6 +14,7 @@ Decimal-safe calculation engine, bulk monthly payroll batches and PDF payslips.
 ```
 config/    settings, celery app, root urls
 accounts/  custom User + role (SUPER_ADMIN | BURSARY | STAFF), JWT auth, permissions
+audit/     activity log (AuditEvent) + change-history API (django-simple-history)
 staff/     Faculty, Department, StaffProfile
 payroll/   SalaryScale, AllowanceRule, TaxBand, PayrollBatch, PayrollRecord
            calculator.py  pure Decimal engine (no ORM, unit-tested)
@@ -47,33 +48,55 @@ Nigeria Tax Act 2025: 0% to 800k, 15% to 3m, 18% to 12m, 21% to 25m, 23% to 50m,
 
 ## Setup
 
-Requirements: Python 3.10+, PostgreSQL 14+, Redis 6+.
+Requirements: Python 3.12-3.14 (developed on 3.14, see `.python-version`), Redis 6+ for
+background workers, and PostgreSQL 14+ for production.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # then edit DJANGO_SECRET_KEY and DB_PASSWORD
+pip install -r requirements.txt   # pinned versions; ranges live in requirements.in
+cp .env.example .env              # then set DJANGO_SECRET_KEY (and DB_* for PostgreSQL)
 ```
 
-Create the database:
+### Choosing a database
 
-```sql
-CREATE USER uipayroll WITH PASSWORD 'change-me';
-CREATE DATABASE uipayroll OWNER uipayroll;
-```
+* **SQLite** (`DB_ENGINE=django.db.backends.sqlite3`, the `.env.example` default) is fine for
+  local development and exploring the API. Note that SQLite stores decimals as floats; the
+  payroll constraints tolerate half a kobo so records reconcile, but money is only exact on
+  PostgreSQL.
+* **PostgreSQL** is required for production and for any realistic payroll run:
 
-Migrations (the repo ships empty migration packages; generate them once, in this
-order, and commit them):
+  ```sql
+  CREATE USER uipayroll WITH PASSWORD 'change-me' CREATEDB;   -- CREATEDB lets tests create their DB
+  CREATE DATABASE uipayroll OWNER uipayroll;
+  ```
+
+### Database tables and reference data
+
+Migrations are committed in the repo; just apply them:
 
 ```bash
-python manage.py makemigrations accounts staff payroll
 python manage.py migrate
 python manage.py createsuperuser
-python manage.py seed_payroll                                   # reference data
+python manage.py seed_payroll                                   # reference data (illustrative scales)
 python manage.py seed_payroll --demo --demo-password '<long password>'   # optional demo users
 ```
 
-Start Redis, the Celery worker, and the API (three terminals):
+**Realistic demo data (fresh dev database only).** `seed_demo_data` builds a whole university on top of the
+reference data: ~80 departments, ~540 staff (Nigerian names, grade-appropriate designations, banks, rent,
+cooperative dues, loans), and a year of payroll run through the real batch engine, including a split
+March run, a June loan-entry error that is corrected and re-run, mid-year hires, retirements and October
+promotions, with backdated change history and activity log. The current month is left unpaid.
+
+```bash
+python manage.py seed_demo_data --password '<long password>'     # refuses to run if staff exist
+# logins: admin.demo (Super Admin), bursar.demo / payroll.officer (Bursary), staff.demo (Staff)
+```
+
+### Running
+
+With `CELERY_EAGER=True` (the `.env.example` default) payroll batches run inline and you only
+need `python manage.py runserver`. For real background processing set `CELERY_EAGER=False`
+and run Redis, a worker, and the API (three terminals):
 
 ```bash
 docker run --rm -p 6379:6379 redis:7          # or: redis-server
@@ -110,7 +133,9 @@ at the collection level, and use "Send and Download" for the payslip PDF.
 Key endpoints: `/api/auth/{login,refresh,logout,me,change-password,users}/`,
 `/api/staff/{faculties,departments,profiles}/`, `/api/staff/profiles/me/`,
 `/api/payroll/{salary-scales,allowance-rules,tax-bands,batches,records}/`,
-`/api/payroll/records/{id}/payslip/`, `/api/payroll/records/my-payslip/`.
+`/api/payroll/records/{id}/payslip/`, `/api/payroll/records/my-payslip/`,
+`/api/payroll/batches/{id}/mark-failed/`, `/api/payroll/stats/` (dashboard aggregates, managers only),
+`/api/audit/{changes,events}/`.
 
 ## Tests
 
@@ -120,17 +145,84 @@ Key endpoints: `/api/auth/{login,refresh,logout,me,change-password,users}/`,
 DJANGO_DEBUG=True DB_ENGINE=django.db.backends.sqlite3 DB_NAME=:memory: python manage.py test
 ```
 
+`payroll/tests/test_review_fixes.py` holds regression tests for issues found in a code review
+(silent record loss, stuck batches, validation gaps, ...); each test's name and docstring
+describe the bug it guards against.
+
+## Audit trail
+
+Two complementary records, both read-only:
+
+**1. Change history** (who changed what, when, old -> new value), via
+[django-simple-history](https://django-simple-history.readthedocs.io/). Tracked models:
+users, faculties, departments, staff profiles, salary scales, allowance rules and tax bands.
+Every create/update/delete is captured, whether made through the API or the Django admin,
+with the user who made it.
+
+```bash
+# All changes to one salary-scale row (payroll managers)
+curl -s "localhost:8000/api/audit/changes/?model=salaryscale&object_id=12" -H "Authorization: Bearer $ACCESS"
+# Everything one user changed in staff profiles during November
+curl -s "localhost:8000/api/audit/changes/?model=staffprofile&changed_by=3&since=2026-11-01&until=2026-11-30" -H "Authorization: Bearer $ACCESS"
+```
+
+Each entry: `change_type` (created/updated/deleted), `changed_at`, `changed_by`, and
+`changes: [{field, old, new}]`. `model` is one of `user, faculty, department, staffprofile,
+salaryscale, allowancerule, taxband`; `user` history is Super Administrator only. In the
+admin, every tracked record has a **History** button. One-click revert is disabled on purpose
+(it would bypass validation); make corrections as normal edits, which are recorded too.
+Password hashes and `last_login` are never copied into history.
+
+**2. Activity log** (Super Administrator only): `GET /api/audit/events/`, also in the admin
+under *Audit events*. Records successful and failed logins (with IP address and user agent),
+password changes, payroll batches triggered or manually marked as failed, and every payslip
+download (with whose payslip it was). Filters: `action`, `actor`, `username`, `target_type`,
+`target_id`, `since`, `until`.
+
+**Existing databases:** records created before the audit trail was added have no history
+yet. After migrating, take a baseline snapshot once: `python manage.py populate_history --auto`.
+
+Limits worth knowing: `QuerySet.update()`, raw SQL and plain `bulk_create()` bypass the
+change history (the code uses `bulk_create_with_history` where it matters). In production,
+give the application's database user no rights to modify or delete the `historical*` and
+`audit_auditevent` tables beyond INSERT/SELECT if you need tamper-resistance. Retention is
+unlimited: history is never pruned automatically.
+
+## Operations checklist
+
+* **Production deploy:** `DJANGO_DEBUG=False`, `CELERY_EAGER=False`, PostgreSQL, real SMTP,
+  then `python manage.py collectstatic` (WhiteNoise serves the files under gunicorn).
+* **Every new tax year (before January payroll):** load and verify that year's PAYE bands.
+  `python manage.py seed_payroll --tax-year 2027` copies the latest year's bands as a starting
+  point; edit them in the admin or via `/api/payroll/tax-bands/`. A batch for a year without
+  valid bands is rejected with a 400.
+* **Stuck batches:** if a worker dies, Redis re-delivers its task after the visibility
+  timeout (`CELERY_BROKER_TRANSPORT_OPTIONS`, 40 min; keep it above the 35 min task time
+  limit) and the re-delivered task resumes the batch automatically (verified with `kill -9`
+  on a 60k-staff batch). Batches still stuck 10 min after that are marked FAILED by
+  `python manage.py fail_stale_batches` (run it from cron every 15 minutes) or by Celery beat
+  (`celery -A config beat`, schedule in `CELERY_BEAT_SCHEDULE`). They are also swept whenever a
+  new batch is triggered. A manager can force it with
+  `POST /api/payroll/batches/{id}/mark-failed/`. Re-triggering is always safe: already-paid
+  staff are skipped.
+
 ## Design decisions worth knowing
 
 * **Idempotent, resumable batches.** Staff already paid for a period are skipped;
   `unique(staff, year, month)` is the final guard. A failed/partial batch can simply
   be re-triggered. One bad employee is logged in `error_log` and never aborts the run.
+* **Every staff member is accounted for.** `processed + skipped + failed == total_staff`
+  for every batch; a row the database rejects is reported in `error_log` (never silently
+  dropped), and any mismatch marks the batch `COMPLETED_WITH_ERRORS`.
+* **Staff are in scope** if active, with an active user account, employed on or before the
+  last day of the period, and in one of the batch's faculties.
 * **Immutable records.** `PayrollRecord` stores a full snapshot (amounts, scale, grade,
   step) with DB `CHECK` constraints that gross/deductions/net reconcile. `save()` on an
   existing row and `delete()` raise; the admin is read-only. (Raw SQL or
   `QuerySet.update()` can still bypass this - restrict DB privileges in production.)
-* **Overlapping allowance rules are rejected** at write time and again at run time,
-  because silently double-paying is worse than failing.
+* **Overlapping allowance rules (and tax bands) are rejected** at write time, in both the
+  API and the Django admin (shared checks in `payroll/validators.py`), and again at run
+  time, because silently double-paying is worse than failing.
 * **Access control lives in the queryset** for staff, so other people's records are 404s.
 * Access tokens last 15 minutes; refresh tokens rotate and are blacklisted on logout.
 
@@ -138,8 +230,6 @@ DJANGO_DEBUG=True DB_ENGINE=django.db.backends.sqlite3 DB_NAME=:memory: python m
 
 * **Not modelled:** NHF (2.5% of basic) and NHIS deductions, other PAYE reliefs, mid-month
   joiners/leavers (proration), arrears, overtime, and bank payment-file export.
-* **No audit trail** of who edited salary scales or tax bands - add `django-simple-history`
-  before production.
 * **Effective-dated scales:** `SalaryScale` has no effective date; history is protected
   only because records snapshot their amounts.
 * Verify every statutory rate with the Bursary/Tax adviser before go-live; laws change.

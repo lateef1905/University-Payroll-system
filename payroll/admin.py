@@ -1,10 +1,28 @@
 from django.contrib import admin
+from simple_history.admin import SimpleHistoryAdmin
 
 from .models import AllowanceRule, PayrollBatch, PayrollRecord, SalaryScale, TaxBand
 
-admin.site.register(SalaryScale)
-admin.site.register(AllowanceRule)
-admin.site.register(TaxBand)
+@admin.register(SalaryScale)
+class SalaryScaleAdmin(SimpleHistoryAdmin):
+    list_display = ("scale", "grade_level", "step", "annual_basic")
+    list_filter = ("scale", "grade_level")
+
+
+@admin.register(AllowanceRule)
+class AllowanceRuleAdmin(SimpleHistoryAdmin):
+    """Overlap checks run in AllowanceRule.clean() - same rules as the API."""
+
+    list_display = ("allowance_type", "calc_method", "value", "employment_type", "salary_scale", "min_grade", "max_grade", "is_active")
+    list_filter = ("allowance_type", "employment_type", "is_active")
+
+
+@admin.register(TaxBand)
+class TaxBandAdmin(SimpleHistoryAdmin):
+    """Overlap checks run in TaxBand.clean() - same rules as the API."""
+
+    list_display = ("tax_year", "lower_bound", "upper_bound", "rate_percent")
+    list_filter = ("tax_year",)
 
 
 @admin.register(PayrollBatch)

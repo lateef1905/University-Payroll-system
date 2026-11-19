@@ -46,18 +46,23 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",  # enables refresh-token revocation (logout)
     "drf_spectacular",
+    "simple_history",  # change history (audit trail) for payroll/staff/user data
     # Local
     "accounts",
     "staff",
     "payroll",
+    "audit",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",  # serves STATIC_ROOT (admin CSS/JS) under gunicorn
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # Lets history rows record WHO made a change (admin session or API JWT user).
+    "simple_history.middleware.HistoryRequestMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -120,7 +125,17 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
+STATIC_ROOT = BASE_DIR / "staticfiles"  # filled by `python manage.py collectstatic` on deploy
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": (
+            "django.contrib.staticfiles.storage.StaticFilesStorage"
+            if DEBUG
+            else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        )
+    },
+}
 
 # --------------------------------------------------------------------------
 # Django REST Framework
@@ -154,7 +169,9 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
-    "UPDATE_LAST_LOGIN": True,
+    # last_login is updated by accounts.views.LoginView (without writing a
+    # change-history row on every login; logins go to the activity log instead).
+    "UPDATE_LAST_LOGIN": False,
     "ALGORITHM": "HS256",
     "SIGNING_KEY": SECRET_KEY,
     "AUTH_HEADER_TYPES": ("Bearer",),
@@ -172,6 +189,12 @@ SPECTACULAR_SETTINGS = {
         ["rest_framework.permissions.AllowAny"] if DEBUG else ["rest_framework.permissions.IsAdminUser"]
     ),
     "COMPONENT_SPLIT_REQUEST": True,
+    # Stable, readable enum names in the OpenAPI schema.
+    "ENUM_NAME_OVERRIDES": {
+        "SalaryScaleEnum": "staff.models.SalaryScaleType",
+        "EmploymentTypeEnum": "staff.models.EmploymentType",
+        "AllowanceEmploymentTypeEnum": [("ALL", "All staff"), ("ACADEMIC", "Academic"), ("NON_ACADEMIC", "Non-Academic")],
+    },
 }
 
 # --------------------------------------------------------------------------
@@ -189,9 +212,20 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_SOFT_TIME_LIMIT = 60 * 30
 CELERY_TASK_TIME_LIMIT = 60 * 35
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+# With acks_late, Redis re-delivers a task whose worker died only after this
+# timeout (Celery's default is 1 hour). It must stay LONGER than the hard time
+# limit, or a still-running task would be delivered twice. A re-delivered payroll
+# task resumes its batch; payroll.maintenance only fails batches stuck longer
+# than this, so the automatic resume always gets its chance first.
+CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": CELERY_TASK_TIME_LIMIT + 5 * 60}
 # Dev convenience: run tasks inline (no Redis/worker). NEVER enable in production.
 CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_EAGER", False)
 CELERY_TASK_EAGER_PROPAGATES = CELERY_TASK_ALWAYS_EAGER
+# Only used if a beat process runs (`celery -A config beat`); cron + the
+# `fail_stale_batches` management command is an equivalent alternative.
+CELERY_BEAT_SCHEDULE = {
+    "fail-stale-payroll-batches": {"task": "payroll.fail_stale_batches", "schedule": 15 * 60},
+}
 
 # --------------------------------------------------------------------------
 # Email (payroll report dispatch)
@@ -224,6 +258,13 @@ PAYROLL = {
     "BATCH_CHUNK_SIZE": 500,
     "NOTIFY_STAFF_BY_EMAIL": env_bool("PAYROLL_NOTIFY_STAFF", True),
 }
+
+# --------------------------------------------------------------------------
+# Audit trail
+# --------------------------------------------------------------------------
+# History is read-only evidence: no one-click "revert" in the admin (a revert would
+# bypass the API's business-rule validation). Make corrections as normal edits.
+SIMPLE_HISTORY_REVERT_DISABLED = True
 
 # --------------------------------------------------------------------------
 # Production hardening

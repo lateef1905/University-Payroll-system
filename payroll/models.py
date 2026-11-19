@@ -6,7 +6,9 @@ from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import F, Q
+from simple_history.models import HistoricalRecords
 
+from .validators import check_allowance_rule, check_tax_band
 from staff.models import (
     MAX_GRADE_LEVEL,
     MAX_STEP,
@@ -19,6 +21,12 @@ from staff.models import (
 
 MONEY = dict(max_digits=14, decimal_places=2)
 ZERO = Decimal("0.00")
+HALF_KOBO = Decimal("0.005")
+
+
+def _within_half_kobo(field: str, expr) -> Q:
+    """`field` equals `expr` to within half a kobo (see PayrollRecord constraints)."""
+    return Q(**{f"{field}__gte": expr - HALF_KOBO}) & Q(**{f"{field}__lte": expr + HALF_KOBO})
 
 
 class SalaryScale(TimeStampedModel):
@@ -28,6 +36,7 @@ class SalaryScale(TimeStampedModel):
     grade_level = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(MAX_GRADE_LEVEL)])
     step = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(MAX_STEP)])
     annual_basic = models.DecimalField(validators=[MinValueValidator(Decimal("0.01"))], **MONEY)
+    history = HistoricalRecords()
 
     class Meta:
         ordering = ["scale", "grade_level", "step"]
@@ -67,6 +76,7 @@ class AllowanceRule(TimeStampedModel):
     min_grade = models.PositiveSmallIntegerField(default=1, validators=[MinValueValidator(1), MaxValueValidator(MAX_GRADE_LEVEL)])
     max_grade = models.PositiveSmallIntegerField(default=MAX_GRADE_LEVEL, validators=[MinValueValidator(1), MaxValueValidator(MAX_GRADE_LEVEL)])
     is_active = models.BooleanField(default=True, db_index=True)
+    history = HistoricalRecords()
 
     class Meta:
         ordering = ["allowance_type", "employment_type", "min_grade"]
@@ -78,6 +88,10 @@ class AllowanceRule(TimeStampedModel):
             ),
         ]
         indexes = [models.Index(fields=["allowance_type", "is_active"], name="allowance_type_active_idx")]
+
+    def clean(self):
+        super().clean()
+        check_allowance_rule(self)
 
     def __str__(self):
         unit = "%" if self.calc_method == AllowanceMethod.PERCENT_OF_BASIC else " NGN/month"
@@ -91,6 +105,7 @@ class TaxBand(TimeStampedModel):
     lower_bound = models.DecimalField(validators=[MinValueValidator(Decimal("0.00"))], **MONEY)
     upper_bound = models.DecimalField(null=True, blank=True, **MONEY)
     rate_percent = models.DecimalField(max_digits=5, decimal_places=2, validators=[MinValueValidator(Decimal("0.00")), MaxValueValidator(Decimal("100.00"))])
+    history = HistoricalRecords()
 
     class Meta:
         ordering = ["tax_year", "lower_bound"]
@@ -99,6 +114,10 @@ class TaxBand(TimeStampedModel):
             models.CheckConstraint(condition=Q(upper_bound__isnull=True) | Q(upper_bound__gt=F("lower_bound")), name="taxband_upper_gt_lower"),
             models.CheckConstraint(condition=Q(rate_percent__gte=0) & Q(rate_percent__lte=100), name="taxband_rate_range"),
         ]
+
+    def clean(self):
+        super().clean()
+        check_tax_band(self)
 
     def __str__(self):
         return f"{self.tax_year}: {self.lower_bound}-{self.upper_bound or 'above'} @ {self.rate_percent}%"
@@ -189,20 +208,28 @@ class PayrollRecord(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["staff", "period_year", "period_month"], name="uniq_record_staff_period"),
             models.CheckConstraint(condition=Q(period_month__gte=1) & Q(period_month__lte=12), name="record_month_range"),
+            # Reconciliation checks allow +/- half a kobo. Every value has 2 decimal places,
+            # so on PostgreSQL (exact NUMERIC) this is equivalent to equality; on SQLite,
+            # which stores decimals as floats, an exact equality check spuriously fails.
             models.CheckConstraint(
-                condition=Q(
-                    gross_earnings=F("basic_salary") + F("housing_allowance") + F("transport_allowance")
-                    + F("research_allowance") + F("medical_allowance")
+                condition=_within_half_kobo(
+                    "gross_earnings",
+                    F("basic_salary") + F("housing_allowance") + F("transport_allowance")
+                    + F("research_allowance") + F("medical_allowance"),
                 ),
                 name="record_gross_is_sum_of_earnings",
             ),
             models.CheckConstraint(
-                condition=Q(
-                    total_deductions=F("pension_employee") + F("paye_tax") + F("cooperative_dues") + F("loan_repayment")
+                condition=_within_half_kobo(
+                    "total_deductions",
+                    F("pension_employee") + F("paye_tax") + F("cooperative_dues") + F("loan_repayment"),
                 ),
                 name="record_deductions_is_sum",
             ),
-            models.CheckConstraint(condition=Q(net_pay=F("gross_earnings") - F("total_deductions")), name="record_net_equals_gross_minus_deductions"),
+            models.CheckConstraint(
+                condition=_within_half_kobo("net_pay", F("gross_earnings") - F("total_deductions")),
+                name="record_net_equals_gross_minus_deductions",
+            ),
             models.CheckConstraint(condition=Q(net_pay__gte=0), name="record_net_non_negative"),
         ]
         indexes = [

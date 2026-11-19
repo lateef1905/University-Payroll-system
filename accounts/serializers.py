@@ -85,6 +85,12 @@ class UserUpdateSerializer(serializers.ModelSerializer):
     def validate_role(self, value):
         if value not in Role.values:
             raise serializers.ValidationError("Invalid role.")
+        # User.save() forces superusers back to SUPER_ADMIN; say so instead of silently ignoring the change.
+        if self.instance is not None and self.instance.is_superuser and value != Role.SUPER_ADMIN:
+            raise serializers.ValidationError(
+                "This account is a Django superuser and is always a Super Administrator. "
+                "Remove superuser status in the admin first."
+            )
         return value
 
 
@@ -104,5 +110,11 @@ class ChangePasswordSerializer(serializers.Serializer):
     def save(self, **kwargs):
         user = self.context["request"].user
         user.set_password(self.validated_data["new_password"])
-        user.save(update_fields=["password"])
+        # The password hash is not tracked in change history; the change is
+        # recorded as a PASSWORD_CHANGED activity event instead (ChangePasswordView).
+        user.skip_history_when_saving = True
+        try:
+            user.save(update_fields=["password"])
+        finally:
+            del user.skip_history_when_saving
         return user

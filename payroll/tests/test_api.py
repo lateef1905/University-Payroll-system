@@ -28,7 +28,9 @@ def make_staff(username, dept, staff_id, **kw):
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
-class PayrollApiTests(APITestCase):
+class PayrollFixtures(APITestCase):
+    """Shared data and helpers: two faculties, three staff, one bursar."""
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -70,6 +72,8 @@ class PayrollApiTests(APITestCase):
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.post("/api/payroll/batches/", body, format="json")
 
+
+class PayrollApiTests(PayrollFixtures):
     # ---- RBAC ----
     def test_anonymous_is_rejected(self):
         self.assertEqual(self.client.get("/api/payroll/records/").status_code, 401)
@@ -148,3 +152,62 @@ class PayrollApiTests(APITestCase):
             rec.save()
         with self.assertRaises(PermissionError):
             rec.delete()
+
+
+class PayslipAcceptHeaderTests(PayrollFixtures):
+    """Regression: `Accept: application/pdf` used to get 406 Not Acceptable from DRF content negotiation."""
+
+    def test_payslip_download_accepts_pdf_header(self):
+        self.login("bursar")
+        self.trigger(all_faculties=True)
+        self.login("alice")
+        today = timezone.localdate()
+        url = f"/api/payroll/records/my-payslip/?year={today.year}&month={today.month}"
+        r = self.client.get(url, HTTP_ACCEPT="application/pdf")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r["Content-Type"], "application/pdf")
+        rec = PayrollRecord.objects.get(staff=self.p1)
+        r = self.client.get(f"/api/payroll/records/{rec.pk}/payslip/", HTTP_ACCEPT="application/pdf")
+        self.assertEqual(r.status_code, 200)
+
+    def test_payslip_errors_stay_json_with_pdf_header(self):
+        self.login("alice")
+        r = self.client.get("/api/payroll/records/my-payslip/?year=2001&month=1", HTTP_ACCEPT="application/pdf")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r["Content-Type"], "application/json")
+        self.assertIn("detail", r.json())
+
+
+class PayrollStatsTests(PayrollFixtures):
+    """Dashboard aggregates (/api/payroll/stats/)."""
+
+    def test_stats_are_manager_only(self):
+        self.login("alice")
+        self.assertEqual(self.client.get("/api/payroll/stats/").status_code, 403)
+
+    def test_stats_empty_before_any_run(self):
+        self.login("bursar")
+        r = self.client.get("/api/payroll/stats/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.data["period"])
+        self.assertEqual(r.data["trend"], [])
+        self.assertEqual(r.data["headcount"]["active"], 3)
+
+    def test_stats_totals_match_records(self):
+        self.login("bursar")
+        self.trigger(all_faculties=True)
+        r = self.client.get("/api/payroll/stats/")
+        self.assertEqual(r.status_code, 200)
+        today = timezone.localdate()
+        self.assertEqual(r.data["period"]["label"], f"{today.year}-{today.month:02d}")
+        [point] = r.data["trend"]
+        recs = PayrollRecord.objects.all()
+        self.assertEqual(point["staff"], 3)
+        self.assertEqual(D(point["net"]), sum(x.net_pay for x in recs))
+        self.assertEqual(sum(f["staff"] for f in r.data["by_faculty"]), 3)
+        self.assertEqual(sum(D(f["gross"]) for f in r.data["by_faculty"]), D(point["gross"]))
+        self.assertEqual(r.data["batches"]["COMPLETED"], 1)
+
+    def test_stats_rejects_bad_month(self):
+        self.login("bursar")
+        self.assertEqual(self.client.get("/api/payroll/stats/?year=2026&month=13").status_code, 400)
