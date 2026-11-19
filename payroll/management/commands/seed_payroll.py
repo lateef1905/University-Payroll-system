@@ -33,6 +33,7 @@ FACULTIES = [
     ("Law", "LAW"), ("Technology", "TEC"), ("Agriculture", "AGR"), ("Pharmacy", "PHA"),
     ("Veterinary Medicine", "VET"), ("Basic Medical Sciences", "BMS"), ("Clinical Sciences", "CLS"),
     ("Public Health", "PUH"), ("Dentistry", "DEN"), ("Multidisciplinary Studies", "MDS"),
+    ("Computing", "CMP"),  # approved by Senate in March 2025; grew out of the Department of Computer Science
 ]
 
 # (annual base for step 1) per CONUASS level 1..7 - illustrative only
@@ -123,8 +124,10 @@ class Command(BaseCommand):
         ))
 
     def _demo(self, password):
-        faculty = Faculty.objects.get(code="SCI")
-        dept, _ = Department.objects.get_or_create(faculty=faculty, code="CSC", defaults={"name": "Computer Science"})
+        faculty = Faculty.objects.get(code="CMP")
+        dept, _ = Department.objects.get_or_create(
+            faculty=faculty, code="CSC", defaults={"name": "Computer Science and Artificial Intelligence"}
+        )
 
         bursar, created = User.objects.get_or_create(
             username="bursar.demo", defaults={"email": "bursar.demo@example.edu.ng", "first_name": "Demo", "last_name": "Bursar", "role": Role.BURSARY}
