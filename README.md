@@ -1,6 +1,6 @@
 # University of Ibadan - Employee Payroll Management System
 
-Django + DRF + PostgreSQL + Celery/Redis backend with JWT role-based access, a
+Django + DRF + PostgreSQL + Celery/Redis backend (the React client lives in `../Univerisity-Payroll-client`) with JWT role-based access, a
 Decimal-safe calculation engine, bulk monthly payroll batches and PDF payslips.
 
 > **Read this first.** The salary figures produced by `seed_payroll` are
@@ -81,6 +81,17 @@ python manage.py seed_payroll                                   # reference data
 python manage.py seed_payroll --demo --demo-password '<long password>'   # optional demo users
 ```
 
+**Realistic demo data (fresh dev database only).** `seed_demo_data` builds a whole university on top of the
+reference data: ~80 departments, ~540 staff (Nigerian names, grade-appropriate designations, banks, rent,
+cooperative dues, loans), and a year of payroll run through the real batch engine, including a split
+March run, a June loan-entry error that is corrected and re-run, mid-year hires, retirements and October
+promotions, with backdated change history and activity log. The current month is left unpaid.
+
+```bash
+python manage.py seed_demo_data --password '<long password>'     # refuses to run if staff exist
+# logins: admin.demo (Super Admin), bursar.demo / payroll.officer (Bursary), staff.demo (Staff)
+```
+
 ### Running
 
 With `CELERY_EAGER=True` (the `.env.example` default) payroll batches run inline and you only
@@ -123,7 +134,8 @@ Key endpoints: `/api/auth/{login,refresh,logout,me,change-password,users}/`,
 `/api/staff/{faculties,departments,profiles}/`, `/api/staff/profiles/me/`,
 `/api/payroll/{salary-scales,allowance-rules,tax-bands,batches,records}/`,
 `/api/payroll/records/{id}/payslip/`, `/api/payroll/records/my-payslip/`,
-`/api/payroll/batches/{id}/mark-failed/`, `/api/audit/{changes,events}/`.
+`/api/payroll/batches/{id}/mark-failed/`, `/api/payroll/stats/` (dashboard aggregates, managers only),
+`/api/audit/{changes,events}/`.
 
 ## Tests
 
