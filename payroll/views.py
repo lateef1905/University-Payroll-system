@@ -1,6 +1,8 @@
+import json
 import re
 import uuid
 
+from django.db.models import Count, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
@@ -8,12 +10,15 @@ from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
+from rest_framework.views import APIView
 
 from accounts.permissions import IsPayrollManager
 from audit.events import log_event
 from audit.models import AuditAction
+from staff.models import StaffProfile
 from staff.views import ProtectedDeleteMixin
 
 from .models import AllowanceRule, BatchStatus, PayrollBatch, PayrollRecord, SalaryScale, TaxBand
@@ -30,6 +35,28 @@ from .serializers import (
 
 class PayslipDownloadThrottle(UserRateThrottle):
     scope = "payslip"
+
+
+class PDFRenderer(BaseRenderer):
+    """
+    Lets clients send `Accept: application/pdf` to the payslip endpoints (otherwise DRF's
+    content negotiation answers 406 before the view runs). The PDF itself is returned as a
+    plain HttpResponse and never passes through here; this only renders error bodies, as JSON.
+    """
+
+    media_type = "application/pdf"
+    format = "pdf"
+    charset = None
+    render_style = "binary"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        response = (renderer_context or {}).get("response")
+        if response is not None:
+            response["Content-Type"] = "application/json"
+        return json.dumps(data).encode()
+
+
+PAYSLIP_RENDERERS = [JSONRenderer, PDFRenderer]
 
 
 class SalaryScaleViewSet(ProtectedDeleteMixin, viewsets.ModelViewSet):
@@ -174,7 +201,7 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
         return qs
 
     @extend_schema(responses={(200, "application/pdf"): OpenApiTypes.BINARY})
-    @action(detail=True, methods=["get"], url_path="payslip", throttle_classes=[PayslipDownloadThrottle])
+    @action(detail=True, methods=["get"], url_path="payslip", throttle_classes=[PayslipDownloadThrottle], renderer_classes=PAYSLIP_RENDERERS)
     def payslip(self, request, pk=None):
         """Generate and download the PDF payslip for one record."""
         return _pdf_response(request, self.get_object())
@@ -186,7 +213,7 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
         ],
         responses={(200, "application/pdf"): OpenApiTypes.BINARY},
     )
-    @action(detail=False, methods=["get"], url_path="my-payslip", throttle_classes=[PayslipDownloadThrottle])
+    @action(detail=False, methods=["get"], url_path="my-payslip", throttle_classes=[PayslipDownloadThrottle], renderer_classes=PAYSLIP_RENDERERS)
     def my_payslip(self, request):
         """Convenience for staff: download MY payslip for ?year=&month=."""
         year, month = request.query_params.get("year", ""), request.query_params.get("month", "")
@@ -200,3 +227,115 @@ class PayrollRecordViewSet(viewsets.ReadOnlyModelViewSet):
         if record is None:
             raise NotFound("No payslip exists for that period.")
         return _pdf_response(request, record)
+
+
+_MONEY_SUMS = {
+    "gross": Sum("gross_earnings"),
+    "deductions": Sum("total_deductions"),
+    "net": Sum("net_pay"),
+    "paye": Sum("paye_tax"),
+    "pension_employee": Sum("pension_employee"),
+    "pension_employer": Sum("pension_employer"),
+    "cooperative": Sum("cooperative_dues"),
+    "loans": Sum("loan_repayment"),
+}
+
+
+def _money_row(row: dict) -> dict:
+    """Money sums as fixed 2-dp strings (the API's usual wire format); a NULL sum is 0.00."""
+    return {k: (f"{v or 0:.2f}" if k in _MONEY_SUMS else v) for k, v in row.items()}
+
+
+class PayrollStatsView(APIView):
+    """
+    Dashboard aggregates for payroll managers, computed in the database.
+
+    * `trend`: totals per pay period for the last `months` periods (default 12, max 36).
+    * `period`: the period the breakdowns describe: `?year=&month=`, else the latest paid period.
+    * `by_faculty` / `by_scale`: that period's totals per faculty and per salary scale.
+    * `headcount`: current staff profiles; `batches`: batch count per status.
+    """
+
+    permission_classes = [IsPayrollManager]
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("year", int), OpenApiParameter("month", int),
+            OpenApiParameter("months", int, description="Trend length (1-36, default 12)."),
+        ],
+        responses={200: OpenApiTypes.OBJECT},
+    )
+    def get(self, request):
+        p = request.query_params
+        months = int(p["months"]) if p.get("months", "").isdigit() else 12
+        months = min(max(months, 1), 36)
+
+        records = PayrollRecord.objects.all()
+        periods = (
+            records.values("period_year", "period_month")
+            .annotate(staff=Count("id"), **_MONEY_SUMS)
+            .order_by("-period_year", "-period_month")[:months]
+        )
+        trend = [
+            _money_row({"period": f"{r['period_year']}-{r['period_month']:02d}", "year": r["period_year"], "month": r["period_month"], **{k: r[k] for k in ("staff", *_MONEY_SUMS)}})
+            for r in reversed(list(periods))
+        ]
+
+        if p.get("year", "").isdigit() and p.get("month", "").isdigit():
+            year, month = int(p["year"]), int(p["month"])
+            if not 1 <= month <= 12:
+                raise ValidationError({"month": "Must be 1-12."})
+        elif trend:
+            year, month = trend[-1]["year"], trend[-1]["month"]
+        else:
+            year = month = None
+
+        by_faculty, by_scale, by_type = [], [], []
+        if year is not None:
+            in_period = records.filter(period_year=year, period_month=month)
+            by_faculty = [
+                _money_row({
+                    "faculty_id": r["staff__department__faculty_id"],
+                    "name": r["staff__department__faculty__name"],
+                    "code": r["staff__department__faculty__code"],
+                    "staff": r["staff_count"], "gross": r["gross"], "net": r["net"], "paye": r["paye"],
+                })
+                for r in in_period.values(
+                    "staff__department__faculty_id", "staff__department__faculty__name", "staff__department__faculty__code"
+                ).annotate(staff_count=Count("id"), gross=Sum("gross_earnings"), net=Sum("net_pay"), paye=Sum("paye_tax"))
+                .order_by("-gross")
+            ]
+            by_scale = [
+                _money_row({"salary_scale": r["salary_scale"], "staff": r["staff_count"], "gross": r["gross"], "net": r["net"]})
+                for r in in_period.values("salary_scale")
+                .annotate(staff_count=Count("id"), gross=Sum("gross_earnings"), net=Sum("net_pay"))
+                .order_by("salary_scale")
+            ]
+            by_type = [
+                _money_row({"employment_type": r["staff__employment_type"], "staff": r["staff_count"], "gross": r["gross"], "net": r["net"]})
+                for r in in_period.values("staff__employment_type")
+                .annotate(staff_count=Count("id"), gross=Sum("gross_earnings"), net=Sum("net_pay"))
+                .order_by("staff__employment_type")
+            ]
+
+        profiles = StaffProfile.objects.all()
+        active = profiles.filter(is_active=True, user__is_active=True)
+        headcount = {
+            "active": active.count(),
+            "academic": active.filter(employment_type="ACADEMIC").count(),
+            "non_academic": active.filter(employment_type="NON_ACADEMIC").count(),
+            "inactive": profiles.count() - active.count(),
+        }
+        batches = {s: 0 for s in BatchStatus.values}
+        for row in PayrollBatch.objects.values("status").annotate(n=Count("id")):
+            batches[row["status"]] = row["n"]
+
+        return Response({
+            "period": None if year is None else {"year": year, "month": month, "label": f"{year}-{month:02d}"},
+            "trend": trend,
+            "by_faculty": by_faculty,
+            "by_scale": by_scale,
+            "by_employment_type": by_type,
+            "headcount": headcount,
+            "batches": batches,
+        })

@@ -1,9 +1,11 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
     AllowanceRuleViewSet,
     PayrollBatchViewSet,
     PayrollRecordViewSet,
+    PayrollStatsView,
     SalaryScaleViewSet,
     TaxBandViewSet,
 )
@@ -15,4 +17,4 @@ router.register("tax-bands", TaxBandViewSet, basename="tax-band")
 router.register("batches", PayrollBatchViewSet, basename="payroll-batch")
 router.register("records", PayrollRecordViewSet, basename="payroll-record")
 
-urlpatterns = router.urls
+urlpatterns = [path("stats/", PayrollStatsView.as_view(), name="payroll-stats"), *router.urls]
